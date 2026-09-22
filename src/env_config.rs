@@ -284,6 +284,76 @@ fn interactive_features() -> Vec<Feature> {
     ]
 }
 
+/// Strip at most one matching pair of wrapping quotes from a `.env` value.
+///
+/// This replaces `trim().trim_matches('"').trim_matches('\'')`, the expression
+/// that stood at all three `.env` value sites. `trim_matches` strips EVERY
+/// matching character off both ends, not one wrapping pair, so a value whose
+/// own content ended in a quote lost it:
+/// `TINA4_CSP="default-src 'self'; form-action 'self'"` reached the framework
+/// as `default-src 'self'; form-action 'self`, which is not a valid CSP source
+/// expression, so the browser dropped the directive and blocked the very form
+/// post it was written to allow. A value of three quotes lost all three, and
+/// `"''"` came out empty.
+///
+/// The two quote characters are deliberately not interchangeable: a pair is a
+/// pair only when both ends are the SAME character, so `'say "hi"'` keeps its
+/// inner double quotes and `"it's"` keeps its apostrophe.
+pub(crate) fn unquote_env_value(value: &str) -> &str {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        if (first == b'"' || first == b'\'') && bytes[bytes.len() - 1] == first {
+            // Both ends are ASCII quotes, so these are char boundaries.
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+/// Render a value for a `.env` line so that reading the file back yields this
+/// exact string — both through `unquote_env_value` above and through the
+/// frameworks' own dotenv parsers, which also read the file the CLI writes.
+///
+/// Writing values bare is what made `tina4 env --sync` destructive rather than
+/// merely wrong: the read unwrapped, the write put nothing back, and the next
+/// read unwrapped again. Measured on 3.8.88, one `--sync` turned
+/// `QUOTED_EMPTY="''"` into an empty value and `PADDED=" spaced "` into
+/// `spaced` — the user's own file, edited in place, with no backup (only
+/// `tina4 env --migrate` writes a `.env.bak`).
+///
+/// A value is quoted only when it does not survive being written bare, which is
+/// exactly when `unquote_env_value` would change it: leading or trailing
+/// whitespace, or a matching pair of quotes at both ends. Everything else is
+/// left alone, so `form-action 'self'` and `say "hi"` keep the shape the user
+/// wrote.
+///
+/// Which quote character is not a free choice. `Tina4/DotEnv.php` — and the
+/// other ports — treat a double-quoted value as escapable and interpolating
+/// (`\x` is `x`, `${VAR}` is substituted) and a single-quoted value as literal,
+/// so a value carrying a backslash, a `"` or a `${` must not be wrapped in
+/// double quotes.
+///
+/// A value that needs quoting AND contains both quote characters cannot be
+/// represented in this format without an escaping scheme the readers do not all
+/// share, so it is left bare. That is what happens today for every such value;
+/// nothing regresses, and the shape is vanishingly rare.
+pub(crate) fn quote_env_value(value: &str) -> String {
+    if unquote_env_value(value) == value {
+        return value.to_string();
+    }
+    let double_quotes_are_safe =
+        !value.contains('"') && !value.contains('\\') && !value.contains("${");
+    if double_quotes_are_safe {
+        return format!("\"{}\"", value);
+    }
+    if !value.contains('\'') {
+        return format!("'{}'", value);
+    }
+    value.to_string()
+}
+
 /// Read current .env file into a map.
 fn read_env(path: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
@@ -295,7 +365,7 @@ fn read_env(path: &str) -> BTreeMap<String, String> {
             }
             if let Some((key, value)) = line.split_once('=') {
                 let key = key.trim().to_string();
-                let value = value.trim().trim_matches('"').trim_matches('\'').to_string();
+                let value = unquote_env_value(value).to_string();
                 map.insert(key, value);
             }
         }
@@ -323,7 +393,7 @@ fn write_env(path: &str, vars: &BTreeMap<String, String>) {
     for (group, entries) in &groups {
         contents.push_str(&format!("# {}\n", group));
         for (key, value) in entries {
-            contents.push_str(&format!("{}={}\n", key, value));
+            contents.push_str(&format!("{}={}\n", key, quote_env_value(value)));
         }
         contents.push('\n');
     }
@@ -331,7 +401,7 @@ fn write_env(path: &str, vars: &BTreeMap<String, String>) {
     // Write any custom vars not in known list
     for (key, value) in vars {
         if !used_keys.contains(key) {
-            contents.push_str(&format!("{}={}\n", key, value));
+            contents.push_str(&format!("{}={}\n", key, quote_env_value(value)));
         }
     }
 
@@ -684,4 +754,151 @@ pub fn run(sync: bool, example_only: bool, list_only: bool) {
         ".env.example".cyan()
     );
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{quote_env_value, unquote_env_value};
+
+    /// Values a `.env` file can hold on one line, including every shape the old
+    /// `trim_matches` chain destroyed. Excludes the one documented shape that
+    /// this format cannot represent — see `a_value_holding_both_quote_characters`.
+    fn cases() -> Vec<&'static str> {
+        vec![
+            "",
+            "x",
+            "hello world",
+            "default-src 'self'; form-action 'self'",
+            "form-action 'self'",
+            "say \"hi\"",
+            "it's",
+            "abc'''",
+            "'''",
+            "''",
+            "\"",
+            "'",
+            "\"\"",
+            " leading",
+            "trailing ",
+            " both ",
+            " say \"hi\" ",
+            " C:\\logs\\app.log ",
+            " ${HOME}/data ",
+            "a=b=c",
+            "#not-a-comment",
+            "postgres://u:p@h/db?sslmode=require",
+        ]
+    }
+
+    #[test]
+    fn a_wrapping_pair_is_removed_once_and_only_once() {
+        assert_eq!(unquote_env_value("\"hello world\""), "hello world");
+        assert_eq!(unquote_env_value("'hello world'"), "hello world");
+        // The value's own trailing quote survives - this is the reported defect.
+        assert_eq!(
+            unquote_env_value("\"default-src 'self'; form-action 'self'\""),
+            "default-src 'self'; form-action 'self'"
+        );
+        assert_eq!(unquote_env_value("form-action 'self'"), "form-action 'self'");
+        assert_eq!(unquote_env_value("\"''\""), "''");
+        assert_eq!(unquote_env_value("abc'''"), "abc'''");
+    }
+
+    #[test]
+    fn mismatched_ends_are_not_a_pair() {
+        assert_eq!(unquote_env_value("'say \"hi\"'"), "say \"hi\"");
+        assert_eq!(unquote_env_value("\"it's\""), "it's");
+        assert_eq!(unquote_env_value("\"abc"), "\"abc");
+        assert_eq!(unquote_env_value("abc\""), "abc\"");
+    }
+
+    #[test]
+    fn a_lone_quote_is_a_value_not_a_wrapper() {
+        assert_eq!(unquote_env_value("\""), "\"");
+        assert_eq!(unquote_env_value("'"), "'");
+        assert_eq!(unquote_env_value("\"\""), "");
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_still_dropped() {
+        assert_eq!(unquote_env_value("  hello  "), "hello");
+        assert_eq!(unquote_env_value("  \" hello \"  "), " hello ");
+    }
+
+    /// The property the write path has to satisfy: whatever `read_env` produced,
+    /// `write_env` must render it so that reading the file back yields the same
+    /// string. Without it `tina4 env --sync` loses a character per run.
+    #[test]
+    fn every_value_round_trips_through_a_written_line() {
+        for value in cases() {
+            let line = format!("KEY={}", quote_env_value(value));
+            let (_, written) = line.split_once('=').expect("line has a separator");
+            assert_eq!(
+                unquote_env_value(written),
+                value,
+                "value {:?} was written as {:?} and read back wrong",
+                value,
+                line
+            );
+        }
+    }
+
+    /// Re-reading and re-writing must reach a fixed point immediately, not decay.
+    #[test]
+    fn writing_twice_changes_nothing() {
+        for value in cases() {
+            let once = quote_env_value(value);
+            let read_back = unquote_env_value(&once).to_string();
+            assert_eq!(quote_env_value(&read_back), once, "value {:?} decayed", value);
+        }
+    }
+
+    /// A value is quoted only when writing it bare would change it. Quoting more
+    /// than that is not free: the frameworks' own parsers read this file, and
+    /// wrapping a value that did not need it can change what THEY see.
+    #[test]
+    fn a_value_that_survives_bare_is_written_bare() {
+        for value in [
+            "hello world",
+            "8080",
+            "",
+            "form-action 'self'",
+            "say \"hi\"",
+            "default-src 'self'; form-action 'self'",
+            "C:\\logs\\app.log",
+            "\"",
+        ] {
+            assert_eq!(quote_env_value(value), value, "{:?} did not need quoting", value);
+        }
+    }
+
+    #[test]
+    fn a_value_that_would_not_survive_bare_is_wrapped() {
+        assert_eq!(quote_env_value(" padded "), "\" padded \"");
+        assert_eq!(quote_env_value("''"), "\"''\"");
+        assert_eq!(quote_env_value("'''"), "\"'''\"");
+    }
+
+    /// `Tina4/DotEnv.php` and its sibling ports read a double-quoted value as
+    /// escapable and interpolating, and a single-quoted one as literal. A value
+    /// carrying a backslash, a `"` or a `${` therefore cannot go in double
+    /// quotes, however well the CLI's own parser would cope.
+    #[test]
+    fn the_wrapping_quote_is_one_the_framework_parsers_read_literally() {
+        assert_eq!(quote_env_value(" say \"hi\" "), "' say \"hi\" '");
+        assert_eq!(quote_env_value(" C:\\logs\\app.log "), "' C:\\logs\\app.log '");
+        assert_eq!(quote_env_value(" ${HOME}/data "), "' ${HOME}/data '");
+        assert_eq!(quote_env_value("\"\""), "'\"\"'");
+    }
+
+    /// The one shape this format cannot represent: it needs quoting AND holds
+    /// both quote characters, so neither wrapper is safe and no escaping scheme
+    /// is shared by all the readers. It is left bare, which is exactly what
+    /// happens today - nothing regresses, and the round trip is lossy.
+    #[test]
+    fn a_value_holding_both_quote_characters_is_left_bare() {
+        let value = " it's \"x\" ";
+        assert_eq!(quote_env_value(value), value);
+        assert_eq!(unquote_env_value(&format!("KEY={}", value).split_once('=').unwrap().1), "it's \"x\"");
+    }
 }

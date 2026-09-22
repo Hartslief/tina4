@@ -625,7 +625,7 @@ pub fn handle_serve(port: Option<u16>, host: &str, force_dev: bool, force_produc
                 }
                 if let Some((key, value)) = line.split_once('=') {
                     let key = key.trim();
-                    let value = value.trim().trim_matches('"').trim_matches('\'');
+                    let value = env_config::unquote_env_value(value);
                     if std::env::var(key).is_err() {
                         std::env::set_var(key, value);
                     }
@@ -982,6 +982,13 @@ fn read_dotenv_bool_from<P: AsRef<std::path::Path>>(path: P, key: &str) -> bool 
         }
         if let Some((k, v)) = line.split_once('=') {
             if k.trim() == key {
+                // Left on the old expression deliberately. Truncation is invisible
+                // here - the result is lower-cased and tested for membership of
+                // {true, 1, yes}, so a lost trailing quote cannot change the
+                // answer for any well-formed value. Switching it to
+                // env_config::unquote_env_value would change what a MALFORMED
+                // value means (`true'` would stop counting as true), and no
+                // report covers that.
                 let v = v.trim().trim_matches('"').trim_matches('\'').to_lowercase();
                 return matches!(v.as_str(), "true" | "1" | "yes");
             }
